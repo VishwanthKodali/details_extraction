@@ -1,50 +1,102 @@
 import pdfplumber
 import re
 import io
-from typing import Dict, List, Any
-from datetime import datetime
-import pytesseract
-from PIL import Image
-import asyncio
+from app.v1.models.detail_extraction import InvoiceData
 
-async def extract_invoice_data(pdf_bytes: bytes) -> Dict[str, Any]:
-    """Async multi-method PDF extraction."""
-    loop = asyncio.get_event_loop()
-    
-    # Method 1: Text + Regex (native PDFs)
-    def text_extract():
-        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-            text = "\n".join(p.extract_text() or "" for p in pdf.pages)
-            tables = [t for p in pdf.pages for t in (p.extract_tables() or [])]
-        return text, tables
-    
-    text, tables = await loop.run_in_executor(None, text_extract)
-    
-    data = {
-        'invoice_number': re.search(r'(?:Invoice|Bill)\s*[#:]?\s*(\w+)', text, re.I),
-        'date': re.search(r'(Date|Inv Date)[:\s]*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})', text, re.I),
-        'total': re.search(r'Total[:\s]*\$?([\d,]+\.?\d*)', text, re.I),
-        'line_items': []
-    }
-    
-    # Method 2: Tables
-    if tables and tables[0]:
-        for row in tables[0][1:]:  # Skip header
-            if len(row) >= 4 and all(row[:4]):
-                data['line_items'].append({
-                    'desc': row[0], 'qty': float(row[1] or 0),
-                    'price': float(row[2] or 0), 'total': float(row[3] or 0)
-                })
-    
-    # Method 3: OCR fallback for images/charts (if low text yield)
-    if len(text.strip()) < 100:
-        img = Image.open(io.BytesIO(pdf_bytes))
-        ocr_text = pytesseract.image_to_string(img)
-        # Re-run regex on ocr_text
-    
-    # Parse matches
-    for key, match in data.items():
-        if match:
-            data[key] = match.group(1).strip()
-    
+def extract_block(text: str, start: str, end: str, max_lines=10) -> str:
+    lines = text.splitlines()
+    capture = False
+    block = []
+
+    for line in lines:
+        if start.lower() in line.lower():
+            capture = True
+            continue
+        if capture:
+            if end.lower() in line.lower():
+                break
+            block.append(line.strip())
+            if len(block) >= max_lines:
+                break
+
+    return " ".join([l for l in block if l])
+
+async def extract_invoice_data(pdf_bytes: bytes) -> InvoiceData:
+    data = InvoiceData()
+
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        text = "\n".join(p.extract_text() or "" for p in pdf.pages)
+
+    # ---------- HEADER ----------
+    match = re.search(r"Order Number:\s*([\d\-]+)", text)
+    data.order_number = match.group(1) if match else ""
+    match = re.search(r"Invoice Number\s*:\s*([A-Z0-9\-]+)", text)
+    data.invoice_number = match.group(1) if match else ""
+    match = re.search(r"Order Date:\s*([\d.]+)", text)
+    data.order_date = match.group(1) if match else ""
+    match = re.search(r"Invoice Date\s*:\s*([\d.]+)", text)
+    data.invoice_date = match.group(1) if match else ""
+    match = re.search(r"(HR-[A-Z0-9\-]+)", text)
+    data.invoice_details = match.group(1) if match else ""
+
+    data.invoice_type = "Cash Memo" if "Cash Memo" in text else "Tax Invoice"
+
+    # ---------- SELLER ----------
+    seller_block = extract_block(
+        text,
+        start="Sold By",
+        end="Billing Address"
+    )
+
+    seller_lines = seller_block.split(",")
+    data.seller_name = seller_lines[0].strip()
+    data.seller_address = seller_block
+    data.seller_info = seller_block
+
+    match = re.search(r"PAN No:\s*([A-Z0-9]+)", text)
+    data.seller_pan = match.group(1) if match else ""
+    match = re.search(r"GST Registration No:\s*([A-Z0-9]+)", text)
+    data.seller_gst = match.group(1) if match else ""
+
+    # ---------- BILLING ----------
+    billing_block = extract_block(
+        text,
+        start="Billing Address",
+        end="Shipping Address"
+    )
+    data.billing_address = billing_block
+
+    # ---------- SHIPPING ----------
+    shipping_block = extract_block(
+        text,
+        start="Shipping Address",
+        end="State/UT Code"
+    )
+    data.shipping_address = shipping_block
+
+    # ---------- STATE & PLACE ----------
+    match = re.search(r"State/UT Code:\s*(\d{2})", text)
+    state = match.group(1) if match else ""
+    data.billing_state_code = state
+    data.shipping_state_code = state
+
+    match = re.search(r"Place of supply:\s*([A-Z ]+)", text)
+    data.place_of_supply = match.group(1).title() if match else ""
+
+    match = re.search(r"Place of delivery:\s*([A-Z ]+)", text)
+    data.place_of_delivery = match.group(1).title() if match else ""
+
+    # ---------- TOTALS (TABLE TRUSTED) ----------
+    amounts = re.findall(r"₹\s*([\d]+\.\d{2})", text)
+    # Amazon footer always: tax first, then total
+    if len(amounts) >= 2:
+        data.total_tax = f"₹{amounts[-2]}"
+        data.total_amount = f"₹{amounts[-1]}"
+    else:
+        data.total_tax = ""
+        data.total_amount = ""
+
+    match = re.search(r"Amount in Words:\s*(.+)", text)
+    data.amount_in_words = match.group(1) if match else ""
+
     return data
